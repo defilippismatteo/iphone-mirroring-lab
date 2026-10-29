@@ -227,8 +227,11 @@ jobs:
           for a, name in methods.items():
               method_to_addresses.setdefault(name, []).append(a)
           root_starts = {int(h['method']['start'],16) for h in hits if h['category']=='storage' and h['method']}
+          if hashlib.sha256(data).hexdigest() != 'ce1cd6c397a2253d8deb1b029442aeafe1e199d7228b24bd26e0f22a7917b570':
+              raise RuntimeError('Build changed: re-identify path helper before using static address')
+          root_starts.add(0x10010ff29)
           for a, name in methods.items():
-              if name in ('ltkKeyClassWithAttestation:', 'ltkInfoForDeviceID:modern:attested:', 'generateLocalLTKWithAttestation:forceDCRTRetrievalWithCompletion:', 'generateLocalAttestedLTKIfNeccessaryWithCompletion:'):
+              if name in ('storeKeychainItemWithAttributeDictionary:updateDictionary:addDictionary:', 'useKeychainForLTKSyncing', 'baseLocalKeysDictionaryForDevice:type:', 'ltkKeyClassWithAttestation:', 'ltkInfoForDeviceID:modern:attested:', 'generateLocalLTKWithAttestation:forceDCRTRetrievalWithCompletion:', 'generateLocalAttestedLTKIfNeccessaryWithCompletion:'):
                   root_starts.add(a)
           for h in hits:
               if h['text'] == ' requireAttestation=true valid=' and h['method']:
