@@ -1,0 +1,149 @@
+name: Data Protection and native key references
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  data-protection-record:
+    runs-on: macos-15-intel
+    timeout-minutes: 10
+    steps:
+      - name: Probe only a newly generated synthetic Data Protection key
+        shell: bash
+        run: |
+          set -euo pipefail
+          /usr/bin/sw_vers
+          cat > "$RUNNER_TEMP/dp_record.swift" <<'SWIFT'
+          import Foundation
+          import Security
+          import CryptoKit
+          import Darwin
+
+          func emit(_ value: [String: Any]) {
+              if let data = try? JSONSerialization.data(withJSONObject: value, options: [.prettyPrinted, .sortedKeys]) {
+                  print(String(decoding: data, as: UTF8.self))
+              }
+          }
+          func fingerprint(_ key: SecKey) -> Data? {
+              guard let pub = SecKeyCopyPublicKey(key), let bytes = SecKeyCopyExternalRepresentation(pub, nil) else { return nil }
+              return Data(SHA256.hash(data: bytes as Data))
+          }
+          func verifies(_ key: SecKey) -> Bool {
+              let message = Data("synthetic-dp-record-control".utf8) as CFData
+              guard let pub = SecKeyCopyPublicKey(key), let signature = SecKeyCreateSignature(key, .ecdsaSignatureMessageX962SHA256, message, nil) else { return false }
+              return SecKeyVerifySignature(pub, .ecdsaSignatureMessageX962SHA256, message, signature, nil)
+          }
+          func load(_ base: [String: Any]) -> (OSStatus, SecKey?) {
+              var query = base
+              query[kSecReturnRef as String] = true
+              query[kSecMatchLimit as String] = kSecMatchLimitOne
+              var value: CFTypeRef?
+              let status = SecItemCopyMatching(query as CFDictionary, &value)
+              guard status == errSecSuccess, let v = value, CFGetTypeID(v) == SecKeyGetTypeID() else { return (status, nil) }
+              return (status, v as! SecKey)
+          }
+          func run() -> [String: Any] {
+              var report: [String: Any] = ["backend": "data-protection", "existing_user_items_queried": false,
+                  "private_material_exported": false, "iphone_pairing_tested": false,
+                  "cryptokit_secure_enclave_available": SecureEnclave.isAvailable]
+              let tag = Data(("synthetic.dp." + UUID().uuidString).utf8)
+              let label = "Synthetic DP laboratory key"
+              let gen: [String: Any] = [kSecAttrKeyType as String: kSecAttrKeyTypeECSECPrimeRandom,
+                  kSecAttrKeySizeInBits as String: 256, kSecUseDataProtectionKeychain as String: true,
+                  kSecPrivateKeyAttrs as String: [kSecAttrIsPermanent as String: false],
+                  kSecPublicKeyAttrs as String: [kSecAttrIsPermanent as String: false]]
+              var error: Unmanaged<CFError>?
+              guard let source = SecKeyCreateRandomKey(gen as CFDictionary, &error) else {
+                  report["lane_status"] = "ephemeral_generation_unavailable"
+                  if let e = error?.takeRetainedValue() { report["error_code"] = CFErrorGetCode(e); report["error_domain"] = CFErrorGetDomain(e) as String }
+                  report["token_update_tested"] = false
+                  return report
+              }
+              guard verifies(source), let original = fingerprint(source) else {
+                  report["lane_status"] = "control_failed"; return report
+              }
+              let add: [String: Any] = [kSecClass as String: kSecClassKey, kSecValueRef as String: source,
+                  kSecAttrApplicationTag as String: tag, kSecAttrLabel as String: label,
+                  kSecUseDataProtectionKeychain as String: true,
+                  kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
+                  kSecAttrSynchronizable as String: false]
+              let addStatus = SecItemAdd(add as CFDictionary, nil)
+              report["persistent_add_status"] = addStatus
+              report["ephemeral_signature_verified"] = true
+              guard addStatus == errSecSuccess else {
+                  report["lane_status"] = addStatus == errSecMissingEntitlement ? "blocked_by_signing_entitlements" : "persistent_add_unavailable"
+                  report["token_update_tested"] = false
+                  return report
+              }
+              let base: [String: Any] = [kSecClass as String: kSecClassKey,
+                  kSecAttrKeyClass as String: kSecAttrKeyClassPrivate, kSecAttrApplicationTag as String: tag,
+                  kSecUseDataProtectionKeychain as String: true, kSecAttrSynchronizable as String: false]
+              defer { print("SYNTHETIC_DP_CLEANUP_STATUS " + String(SecItemDelete(base as CFDictionary))) }
+              let before = load(base)
+              report["stored_copy_status"] = before.0
+              guard let stored = before.1, verifies(stored), fingerprint(stored) == original else {
+                  report["lane_status"] = "control_failed"; return report
+              }
+              let rename = SecItemUpdate(base as CFDictionary, [kSecAttrLabel as String: label + " renamed"] as CFDictionary)
+              report["rename_control_status"] = rename
+              guard rename == errSecSuccess else { report["lane_status"] = "control_failed"; return report }
+              let update = SecItemUpdate(base as CFDictionary, [kSecAttrTokenID as String: kSecAttrTokenIDSecureEnclave] as CFDictionary)
+              report["requested_token_update_status"] = update
+              report["token_update_tested"] = true
+              let after = load(base)
+              report["copy_after_update_status"] = after.0
+              if let key = after.1 {
+                  let attributes = SecKeyCopyAttributes(key) as? [String: Any] ?? [:]
+                  report["effective_token_after_update"] = attributes[kSecAttrTokenID as String] as? String ?? "none"
+                  report["same_public_key_after_update"] = fingerprint(key) == original
+                  report["signature_after_update_verified"] = verifies(key)
+              }
+              report["lane_status"] = "experiment_completed_not_attestation"
+              return report
+          }
+          let result = run()
+          emit(result)
+          if result["lane_status"] as? String == "control_failed" { exit(1) }
+          SWIFT
+          /usr/bin/xcrun swiftc "$RUNNER_TEMP/dp_record.swift" -o "$RUNNER_TEMP/dp_record"
+          /usr/bin/codesign --force --sign - --identifier org.example.mirroring-lab.dp "$RUNNER_TEMP/dp_record"
+          "$RUNNER_TEMP/dp_record"
+
+  native-storage-references:
+    runs-on: macos-15-intel
+    timeout-minutes: 10
+    steps:
+      - name: Locate static storage names and nearby AKS call sites without invoking them
+        shell: bash
+        run: |
+          set -euo pipefail
+          /usr/bin/sw_vers
+          python3 - <<'PY'
+          import json, re, subprocess
+          binary = '/usr/libexec/sharingd'
+          strings = subprocess.run(['/usr/bin/strings', '-a', binary], capture_output=True, text=True, errors='replace', timeout=90).stdout.splitlines()
+          patterns = {
+              'storage_path_candidates': r'ltk\.plist|pairing.records\.plist|Library/Sharing|AutoUnlock/|localkeys|auto-unlock\.attested|LTKFile',
+              'attestation_and_debug_candidates': r'requireAttestation|localAttestedLTK|(?:test|skip|disable|force|allow).*(?:attest|LTK)|(?:attest|LTK).*(?:test|skip|disable|force|allow)',
+              'key_manager_candidates': r'SDAuthenticationLTKManager|SDAutoUnlockKeyManager|SDAutoUnlockAKSManager|LTKSession\.swift|AKSAuthSession\.swift'
+          }
+          for name, pattern in patterns.items():
+              matches = sorted({line for line in strings if re.search(pattern, line, re.I)})
+              print(json.dumps({'category': name, 'static_candidates_only': True, 'matches': matches[:100], 'total': len(matches)}, indent=2))
+          try:
+              process = subprocess.run(['/usr/bin/otool', '-arch', 'x86_64', '-tvV', binary], capture_output=True, text=True, errors='replace', timeout=150)
+              lines = process.stdout.splitlines()
+              targets = {
+                  'storage_name_xrefs': r'com\.apple\.continuity\.auto-unlock\.(?:attested|localkeys)|ltk\.plist|pairing.records\.plist',
+                  'aks_creation_xrefs': r'symbol stub for: _aks_create_signing_key(?:_with_params)?\b',
+                  'aks_session_xrefs': r'symbol stub for: _aks_remote_session(?:_step|_token)?\b'
+              }
+              for name, pattern in targets.items():
+                  hits = [i for i, line in enumerate(lines) if re.search(pattern, line)]
+                  contexts = [{'matching_instruction': lines[i], 'context': lines[max(0, i-8):i+17]} for i in hits[:4]]
+                  print(json.dumps({'category': name, 'hit_count': len(hits), 'contexts': contexts, 'call_sites_not_executed': True}, indent=2))
+          except subprocess.TimeoutExpired:
+              print(json.dumps({'disassembly_timed_out': True, 'limit_seconds': 150}))
+          PY
