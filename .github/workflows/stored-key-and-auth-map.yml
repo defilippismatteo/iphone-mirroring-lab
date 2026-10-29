@@ -2,6 +2,11 @@ name: Isolated stored key and authentication map
 
 on:
   workflow_dispatch:
+    inputs:
+      map_authentication:
+        description: Include static analysis of Apple binaries
+        type: boolean
+        default: false
 
 permissions: {}
 
@@ -73,7 +78,7 @@ jobs:
               var buffer = [CChar](repeating: 0, count: Int(PATH_MAX))
               var count = UInt32(buffer.count)
               let status = buffer.withUnsafeMutableBufferPointer { p in
-                  SecKeychainGetPath(keychain, &count, p.baseAddress)
+                  SecKeychainGetPath(keychain, &count, p.baseAddress!)
               }
               try checked(status, "read-lab-keychain-path")
               return String(cString: buffer)
@@ -208,6 +213,7 @@ jobs:
           "$RUNNER_TEMP/stored_key_probe"
 
   authentication-static-map:
+    if: ${{ inputs.map_authentication }}
     runs-on: macos-15-intel
     timeout-minutes: 10
     steps:
