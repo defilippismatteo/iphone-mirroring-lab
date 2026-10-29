@@ -7,7 +7,7 @@ jobs:
     runs-on: macos-15-intel
     timeout-minutes: 8
     steps:
-      - name: Map synthetic-free static references
+      - name: Map static references without reading Keychain
         shell: bash
         run: |
           set -euo pipefail
@@ -34,30 +34,115 @@ jobs:
           if image[:4] != b'\xcf\xfa\xed\xfe':
               raise RuntimeError('Expected little-endian Mach-O 64')
           sections = []
+          segments = []
+          chained_payload = None
+          function_blob = b''
+          text_base = None
           cmd_at = 32
           for _ in range(struct.unpack_from('<I', image, 16)[0]):
               cmd, size = struct.unpack_from('<II', image, cmd_at)
+              if cmd == 0x80000034:
+                  chained_payload = struct.unpack_from('<II', image, cmd_at + 8)
+              if cmd == 0x26:
+                  dataoff, datasize = struct.unpack_from('<II', image, cmd_at + 8)
+                  function_blob = image[dataoff:dataoff + datasize]
               if cmd == 0x19:
+                  segname = image[cmd_at+8:cmd_at+24].rstrip(b'\0')
+                  vm, vmsize, fileoff, filesize = struct.unpack_from('<QQQQ', image, cmd_at + 24)
+                  segments.append(dict(vm=vm, vmsize=vmsize, fileoff=fileoff, filesize=filesize))
+                  if segname == b'__TEXT':
+                      text_base = struct.unpack_from('<Q', image, cmd_at + 24)[0]
                   nsects = struct.unpack_from('<I', image, cmd_at + 64)[0]
                   for j in range(nsects):
                       at = cmd_at + 72 + j * 80
                       sect, seg, addr, length, offset = struct.unpack_from('<16s16sQQI', image, at)
                       sections.append(dict(name=sect.rstrip(b'\0').decode(), seg=seg.rstrip(b'\0').decode(), addr=addr, size=length, offset=offset))
               cmd_at += size
-          image_base = min(s['addr'] - s['offset'] for s in sections if s['addr'] and s['offset'])
+          image_base = text_base
+          if image_base is None:
+              raise RuntimeError('Missing __TEXT segment')
+          function_starts = []
+          position = 0
+          pc = image_base
+          while position < len(function_blob):
+              delta = 0
+              shift = 0
+              for _ in range(10):
+                  if position >= len(function_blob):
+                      raise RuntimeError('Truncated ULEB128')
+                  byte = function_blob[position]
+                  position += 1
+                  delta |= (byte & 0x7f) << shift
+                  if not byte & 0x80:
+                      break
+                  shift += 7
+              else:
+                  raise RuntimeError('Invalid ULEB128')
+              if delta == 0:
+                  break
+              pc += delta
+              function_starts.append(pc)
           
           def section_at(address):
               return next((s for s in sections if s['addr'] <= address < s['addr'] + s['size']), None)
           
-          def pointer(value):
-              if section_at(value):
-                  return value
-              candidate = image_base + (value & ((1 << 36) - 1))
-              return candidate if section_at(candidate) else None
+          chain_slots = {}
+          unsupported_formats = set()
+          skipped_multi_pages = 0
+          bound_slots = 0
+          if chained_payload:
+              payload_at, payload_size = chained_payload
+              starts_at = payload_at + struct.unpack_from('<I', image, payload_at + 4)[0]
+              segment_count = struct.unpack_from('<I', image, starts_at)[0]
+              for seg_index in range(segment_count):
+                  info_rel = struct.unpack_from('<I', image, starts_at + 4 + seg_index * 4)[0]
+                  if not info_rel:
+                      continue
+                  info_at = starts_at + info_rel
+                  info_size, page_size, fmt, seg_offset, max_valid, page_count = struct.unpack_from('<IHHQIH', image, info_at)
+                  if fmt not in (2, 6):
+                      unsupported_formats.add(fmt)
+                      continue
+                  segment = segments[seg_index]
+                  if image_base + seg_offset != segment['vm']:
+                      raise RuntimeError('Unexpected chained segment mapping')
+                  for page in range(page_count):
+                      start = struct.unpack_from('<H', image, info_at + 22 + page * 2)[0]
+                      if start == 0xffff:
+                          continue
+                      if start & 0x8000:
+                          skipped_multi_pages += 1
+                          continue
+                      within = start
+                      visited = set()
+                      while True:
+                          if within in visited or within < 0 or within + 8 > page_size:
+                              raise RuntimeError('Invalid chained pointer bounds/cycle')
+                          visited.add(within)
+                          rel = page * page_size + within
+                          if rel + 8 > segment['filesize']:
+                              raise RuntimeError('Chained pointer outside file-backed segment')
+                          slot = segment['vm'] + rel
+                          raw = struct.unpack_from('<Q', image, segment['fileoff'] + rel)[0]
+                          if raw >> 63:
+                              chain_slots[slot] = None
+                              bound_slots += 1
+                          else:
+                              unpacked = (raw & ((1 << 36) - 1)) | (((raw >> 36) & 0xff) << 56)
+                              chain_slots[slot] = unpacked if fmt == 2 else image_base + unpacked
+                          stride = 4 * ((raw >> 51) & 0xfff)
+                          if stride == 0:
+                              break
+                          within += stride
+          
+          def pointer(value, slot):
+              if slot in chain_slots:
+                  return chain_slots[slot]
+              return value if section_at(value) else None
           
           strings = {}
           for s in sections:
-              if s['name'] not in ('__cstring', '__objc_methname', '__objc_classname'):
+              if s['name'] not in ('__cstring', '__objc_methname', '__objc_classname', '__oslogstring'):
                   continue
               raw = image[s['offset']:s['offset'] + s['size']]
               for match in re.finditer(rb'[^\0]+', raw):
@@ -67,18 +152,22 @@ jobs:
                       pass
           aliases = dict(strings)
           cf_count = 0
+          unresolved_cfstrings = 0
           sel_count = 0
           for s in sections:
               if s['name'] == '__cfstring':
                   for rel in range(0, s['size'] - 31, 32):
                       raw_ptr = struct.unpack_from('<Q', image, s['offset'] + rel + 16)[0]
-                      target = pointer(raw_ptr)
-                      if target in strings:
+                      target = pointer(raw_ptr, s['addr'] + rel + 16)
+                      expected_length = struct.unpack_from('<Q', image, s['offset'] + rel + 24)[0]
+                      if target in strings and len(strings[target].encode('utf-8')) == expected_length:
                           aliases[s['addr'] + rel] = strings[target]
                           cf_count += 1
+                      else:
+                          unresolved_cfstrings += 1
               elif s['name'] == '__objc_selrefs':
                   for rel in range(0, s['size'] - 7, 8):
-                      target = pointer(struct.unpack_from('<Q', image, s['offset'] + rel)[0])
+                      target = pointer(struct.unpack_from('<Q', image, s['offset'] + rel)[0], s['addr'] + rel)
                       if target in strings:
                           aliases[s['addr'] + rel] = strings[target]
                           sel_count += 1
@@ -105,8 +194,11 @@ jobs:
           method_addresses = sorted(methods)
           
           def containing(address):
-              i = bisect.bisect_right(method_addresses, address) - 1
-              return dict(name=methods[method_addresses[i]], start=hex(method_addresses[i]), distance=address-method_addresses[i], boundary_proven=False) if i >= 0 else None
+              i = bisect.bisect_right(function_starts, address) - 1
+              if i < 0:
+                  return None
+              start = function_starts[i]
+              return dict(name=methods.get(start), start=hex(start), end=hex(function_starts[i+1]) if i+1 < len(function_starts) else None, distance=address-start, boundary_proven=i+1 < len(function_starts))
           
           assembly = subprocess.run(['otool', '-arch', 'x86_64', '-tvV', str(binary)], capture_output=True, text=True, timeout=150, check=True).stdout
           instructions = []
@@ -117,17 +209,27 @@ jobs:
           hits = []
           for i, (addr, operation, line) in enumerate(instructions[:-1]):
               displacement = re.search(r'(-?0x[0-9a-fA-F]+|-?\d+)\(%rip\)', operation)
-              if not displacement:
+              if not displacement or not 1 <= instructions[i+1][0] - addr <= 15:
                   continue
               target = (instructions[i + 1][0] + int(displacement[1], 0)) & ((1 << 64) - 1)
               if target in selected:
                   hits.append(dict(category=category(selected[target]), text=selected[target], target=hex(target), instruction=line, method=containing(addr), context=[r[2] for r in instructions[max(0, i-7):i+15]]))
-          print(json.dumps(dict(category='parser_summary', binary_sha256=hashlib.sha256(data).hexdigest(), x86_slice_offset=base_offset, strings=len(strings), cfstrings_resolved=cf_count, selectors_resolved=sel_count, objc_methods=len(methods), instructions=len(instructions), selected_aliases=len(selected), actual_keychain_reads=False, native_code_invoked=False), indent=2))
+          print(json.dumps(dict(category='parser_summary', binary_sha256=hashlib.sha256(data).hexdigest(), x86_slice_offset=base_offset, strings=len(strings), cfstrings_resolved=cf_count, selectors_resolved=sel_count, objc_methods=len(methods), instructions=len(instructions), selected_aliases=len(selected), function_starts=len(function_starts), chain_slots=len(chain_slots), unsupported_fixup_formats=sorted(unsupported_formats), skipped_multi_pages=skipped_multi_pages, bound_slots=bound_slots, unresolved_cfstrings=unresolved_cfstrings, actual_keychain_reads=False, native_code_invoked=False), indent=2))
           for group in ('storage', 'test_or_policy', 'attestation'):
               found = [h for h in hits if h['category'] == group]
               print(json.dumps(dict(category=group+'_xref_summary', total=len(found), references=[{k:v for k,v in h.items() if k != 'context'} for h in found[:50]], omitted=max(0,len(found)-50)), indent=2))
               for h in found[:(12 if group == 'storage' else 6)]:
                   print(json.dumps(dict(category=group+'_context', **{k:v for k,v in h.items() if k != 'category'}), indent=2))
           print(json.dumps(dict(category='relevant_objc_methods', methods=[dict(address=hex(a), selector=n) for a,n in sorted(methods.items()) if re.search(r'(?i)(ltk|pairingRecord|keychain|keyClass|attestation)',n)][:180]),indent=2))
+          
+          selected_functions = sorted({h['method']['start'] for h in hits if h['category'] == 'storage' and h['method']})
+          for function_hex in selected_functions[:12]:
+              start = int(function_hex, 16)
+              index = bisect.bisect_left(function_starts, start)
+              if index + 1 >= len(function_starts):
+                  continue
+              end = function_starts[index+1]
+              body = [row for row in instructions if start <= row[0] < end]
+              print(json.dumps(dict(category='storage_function_body', start=function_hex, end=hex(end), objc_method=methods.get(start), instruction_count=len(body), body=[row[2] for row in body[:220]], truncated=len(body)>220), indent=2))
           
           PY
