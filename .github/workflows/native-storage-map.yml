@@ -1,0 +1,133 @@
+name: Native storage and policy map
+on:
+  workflow_dispatch:
+permissions: {}
+jobs:
+  static-map:
+    runs-on: macos-15-intel
+    timeout-minutes: 8
+    steps:
+      - name: Map synthetic-free static references
+        shell: bash
+        run: |
+          set -euo pipefail
+          sw_vers
+          python3 - <<'PY'
+          import bisect, hashlib, json, re, struct, subprocess
+          from pathlib import Path
+          
+          binary = Path('/usr/libexec/sharingd')
+          data = binary.read_bytes()
+          base_offset = 0
+          if data[:4] in (b'\xca\xfe\xba\xbe', b'\xca\xfe\xba\xbf'):
+              is64 = data[3] == 0xbf
+              count = struct.unpack_from('>I', data, 4)[0]
+              for i in range(count):
+                  at = 8 + i * (32 if is64 else 20)
+                  cpu = struct.unpack_from('>I', data, at)[0]
+                  if cpu == 0x01000007:
+                      base_offset = struct.unpack_from('>Q' if is64 else '>I', data, at + 8)[0]
+                      break
+              else:
+                  raise RuntimeError('No x86_64 slice')
+          image = data[base_offset:]
+          if image[:4] != b'\xcf\xfa\xed\xfe':
+              raise RuntimeError('Expected little-endian Mach-O 64')
+          sections = []
+          cmd_at = 32
+          for _ in range(struct.unpack_from('<I', image, 16)[0]):
+              cmd, size = struct.unpack_from('<II', image, cmd_at)
+              if cmd == 0x19:
+                  nsects = struct.unpack_from('<I', image, cmd_at + 64)[0]
+                  for j in range(nsects):
+                      at = cmd_at + 72 + j * 80
+                      sect, seg, addr, length, offset = struct.unpack_from('<16s16sQQI', image, at)
+                      sections.append(dict(name=sect.rstrip(b'\0').decode(), seg=seg.rstrip(b'\0').decode(), addr=addr, size=length, offset=offset))
+              cmd_at += size
+          image_base = min(s['addr'] - s['offset'] for s in sections if s['addr'] and s['offset'])
+          
+          def section_at(address):
+              return next((s for s in sections if s['addr'] <= address < s['addr'] + s['size']), None)
+          
+          def pointer(value):
+              if section_at(value):
+                  return value
+              candidate = image_base + (value & ((1 << 36) - 1))
+              return candidate if section_at(candidate) else None
+          
+          strings = {}
+          for s in sections:
+              if s['name'] not in ('__cstring', '__objc_methname', '__objc_classname'):
+                  continue
+              raw = image[s['offset']:s['offset'] + s['size']]
+              for match in re.finditer(rb'[^\0]+', raw):
+                  try:
+                      strings[s['addr'] + match.start()] = match[0].decode('utf-8')
+                  except UnicodeDecodeError:
+                      pass
+          aliases = dict(strings)
+          cf_count = 0
+          sel_count = 0
+          for s in sections:
+              if s['name'] == '__cfstring':
+                  for rel in range(0, s['size'] - 31, 32):
+                      raw_ptr = struct.unpack_from('<Q', image, s['offset'] + rel + 16)[0]
+                      target = pointer(raw_ptr)
+                      if target in strings:
+                          aliases[s['addr'] + rel] = strings[target]
+                          cf_count += 1
+              elif s['name'] == '__objc_selrefs':
+                  for rel in range(0, s['size'] - 7, 8):
+                      target = pointer(struct.unpack_from('<Q', image, s['offset'] + rel)[0])
+                      if target in strings:
+                          aliases[s['addr'] + rel] = strings[target]
+                          sel_count += 1
+          
+          def category(text):
+              if text in ('ltk.plist', 'pairing-records.plist') or text.startswith('com.apple.continuity.auto-unlock.'):
+                  return 'storage'
+              if re.search(r'(?i)(testing only|forcelocalAttested|requireAttestation|force.*(?:ltk|attest)|skip.*attest|disable.*attest)', text):
+                  return 'test_or_policy'
+              if text in ('generateLocalLTKWithAttestation:', 'generateLocalLTKWithAttestation:forceDCRTRetrievalWithCompletion:', 'ltkKeyClassWithAttestation:', 'ltkInfoForDeviceID:modern:attested:', 'localAttestedLTK') or 'Remote LTK for phone' in text:
+                  return 'attestation'
+              return None
+          selected = {a:t for a,t in aliases.items() if category(t)}
+          metadata = subprocess.run(['otool', '-arch', 'x86_64', '-ov', str(binary)], capture_output=True, text=True, timeout=100, check=True).stdout
+          methods = {}
+          last_name = None
+          for line in metadata.splitlines():
+              named = re.search(r'\bname\s+(?:0x)?[0-9a-fA-F]+\s+(.+)$', line)
+              if named:
+                  last_name = named[1].strip()
+              imp = re.search(r'\bimp\s+(?:0x)?([0-9a-fA-F]{6,16})\b', line)
+              if imp and last_name:
+                  methods[int(imp[1], 16)] = last_name
+          method_addresses = sorted(methods)
+          
+          def containing(address):
+              i = bisect.bisect_right(method_addresses, address) - 1
+              return dict(name=methods[method_addresses[i]], start=hex(method_addresses[i]), distance=address-method_addresses[i], boundary_proven=False) if i >= 0 else None
+          
+          assembly = subprocess.run(['otool', '-arch', 'x86_64', '-tvV', str(binary)], capture_output=True, text=True, timeout=150, check=True).stdout
+          instructions = []
+          for line in assembly.splitlines():
+              m = re.match(r'^([0-9a-fA-F]{16})\s+(.*)', line)
+              if m:
+                  instructions.append((int(m[1], 16), m[2], line))
+          hits = []
+          for i, (addr, operation, line) in enumerate(instructions[:-1]):
+              displacement = re.search(r'(-?0x[0-9a-fA-F]+|-?\d+)\(%rip\)', operation)
+              if not displacement:
+                  continue
+              target = (instructions[i + 1][0] + int(displacement[1], 0)) & ((1 << 64) - 1)
+              if target in selected:
+                  hits.append(dict(category=category(selected[target]), text=selected[target], target=hex(target), instruction=line, method=containing(addr), context=[r[2] for r in instructions[max(0, i-7):i+15]]))
+          print(json.dumps(dict(category='parser_summary', binary_sha256=hashlib.sha256(data).hexdigest(), x86_slice_offset=base_offset, strings=len(strings), cfstrings_resolved=cf_count, selectors_resolved=sel_count, objc_methods=len(methods), instructions=len(instructions), selected_aliases=len(selected), actual_keychain_reads=False, native_code_invoked=False), indent=2))
+          for group in ('storage', 'test_or_policy', 'attestation'):
+              found = [h for h in hits if h['category'] == group]
+              print(json.dumps(dict(category=group+'_xref_summary', total=len(found), references=[{k:v for k,v in h.items() if k != 'context'} for h in found[:50]], omitted=max(0,len(found)-50)), indent=2))
+              for h in found[:(12 if group == 'storage' else 6)]:
+                  print(json.dumps(dict(category=group+'_context', **{k:v for k,v in h.items() if k != 'category'}), indent=2))
+          print(json.dumps(dict(category='relevant_objc_methods', methods=[dict(address=hex(a), selector=n) for a,n in sorted(methods.items()) if re.search(r'(?i)(ltk|pairingRecord|keychain|keyClass|attestation)',n)][:180]),indent=2))
+          
+          PY
