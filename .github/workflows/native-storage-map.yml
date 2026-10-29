@@ -222,14 +222,44 @@ jobs:
                   print(json.dumps(dict(category=group+'_context', **{k:v for k,v in h.items() if k != 'category'}), indent=2))
           print(json.dumps(dict(category='relevant_objc_methods', methods=[dict(address=hex(a), selector=n) for a,n in sorted(methods.items()) if re.search(r'(?i)(ltk|pairingRecord|keychain|keyClass|attestation)',n)][:180]),indent=2))
           
-          selected_functions = sorted({h['method']['start'] for h in hits if h['category'] == 'storage' and h['method']})
-          for function_hex in selected_functions[:12]:
-              start = int(function_hex, 16)
-              index = bisect.bisect_left(function_starts, start)
-              if index + 1 >= len(function_starts):
+          
+          method_to_addresses = {}
+          for a, name in methods.items():
+              method_to_addresses.setdefault(name, []).append(a)
+          root_starts = {int(h['method']['start'],16) for h in hits if h['category']=='storage' and h['method']}
+          for a, name in methods.items():
+              if name in ('ltkKeyClassWithAttestation:', 'ltkInfoForDeviceID:modern:attested:', 'generateLocalLTKWithAttestation:forceDCRTRetrievalWithCompletion:', 'generateLocalAttestedLTKIfNeccessaryWithCompletion:'):
+                  root_starts.add(a)
+          for h in hits:
+              if h['text'] == ' requireAttestation=true valid=' and h['method']:
+                  root_starts.add(int(h['method']['start'],16))
+          queue = [(a,0) for a in sorted(root_starts)]
+          seen = set()
+          while queue and len(seen) < 36:
+              start, depth = queue.pop(0)
+              if start in seen:
+                  continue
+              seen.add(start)
+              index = bisect.bisect_left(function_starts,start)
+              if index >= len(function_starts)-1 or function_starts[index] != start:
                   continue
               end = function_starts[index+1]
-              body = [row for row in instructions if start <= row[0] < end]
-              print(json.dumps(dict(category='storage_function_body', start=function_hex, end=hex(end), objc_method=methods.get(start), instruction_count=len(body), body=[row[2] for row in body[:220]], truncated=len(body)>220), indent=2))
+              body = [(i,row) for i,row in enumerate(instructions) if start <= row[0] < end]
+              annotated = []
+              refs = []
+              for i,row in body:
+                  line = row[2]
+                  match = re.search(r'(-?0x[0-9a-fA-F]+|-?\d+)\(%rip\)',row[1])
+                  if match and i+1 < len(instructions) and 1 <= instructions[i+1][0]-row[0] <= 15:
+                      target = (instructions[i+1][0]+int(match[1],0)) & ((1<<64)-1)
+                      if target in aliases:
+                          text = aliases[target]
+                          line += ' [resolved: '+text[:300]+']'
+                          refs.append(dict(instruction=hex(row[0]),target=hex(target),text=text))
+                          if depth < 2 and re.search(r'(?i)(base.*Dictionary|(?:storage|folder|directory).*path|ltkKeyClass|keychain)',text):
+                              queue.extend((a,depth+1) for a in method_to_addresses.get(text,[]) if a not in seen)
+                  annotated.append(line)
+              print(json.dumps(dict(category='annotated_native_function',start=hex(start),end=hex(end),objc_method=methods.get(start),depth=depth,instruction_count=len(body),references=refs,body=annotated[:260],truncated=len(body)>260),indent=2))
+          print(json.dumps(dict(category='annotation_coverage',functions_emitted=len(seen),queued_not_emitted=len(queue),iphone_authentication_tested=False,actual_records_read=False),indent=2))
           
           PY
