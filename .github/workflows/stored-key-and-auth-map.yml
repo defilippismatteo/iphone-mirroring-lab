@@ -1,0 +1,245 @@
+name: Isolated stored key and authentication map
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  stored-key-record:
+    runs-on: macos-15-intel
+    timeout-minutes: 10
+    steps:
+      - name: Modify only a synthetic key in a dedicated temporary keychain
+        shell: bash
+        run: |
+          set -euo pipefail
+          /usr/bin/sw_vers
+          cat > "$RUNNER_TEMP/stored_key_probe.swift" <<'SWIFT'
+          import Foundation
+          import Security
+          import CryptoKit
+          import Darwin
+
+          _ = SecKeychainSetUserInteractionAllowed(false)
+
+          func checked(_ status: OSStatus, _ operation: String) throws {
+              if status != errSecSuccess { throw NSError(domain: operation, code: Int(status)) }
+          }
+          func emit(_ value: [String: Any]) {
+              if let data = try? JSONSerialization.data(withJSONObject: value, options: [.prettyPrinted, .sortedKeys]) {
+                  print(String(decoding: data, as: UTF8.self))
+              }
+          }
+          func scope(_ keychain: SecKeychain, _ tag: Data, _ label: String) -> [String: Any] {
+              [kSecClass as String: kSecClassKey,
+               kSecAttrKeyClass as String: kSecAttrKeyClassPrivate,
+               kSecAttrKeyType as String: kSecAttrKeyTypeECSECPrimeRandom,
+               kSecAttrApplicationTag as String: tag,
+               kSecAttrLabel as String: label,
+               kSecMatchSearchList as String: [keychain]]
+          }
+          func load(_ scope: [String: Any]) throws -> SecKey {
+              var query = scope
+              query[kSecReturnRef as String] = true
+              query[kSecMatchLimit as String] = kSecMatchLimitOne
+              var value: CFTypeRef?
+              try checked(SecItemCopyMatching(query as CFDictionary, &value), "load-synthetic-key")
+              guard let found = value, CFGetTypeID(found) == SecKeyGetTypeID() else {
+                  throw NSError(domain: "unexpected-key-reference", code: 1)
+              }
+              return found as! SecKey
+          }
+          func proof(_ key: SecKey) throws -> (String, Bool) {
+              var error: Unmanaged<CFError>?
+              guard let publicKey = SecKeyCopyPublicKey(key),
+                    let publicBytes = SecKeyCopyExternalRepresentation(publicKey, &error) else {
+                  throw NSError(domain: "synthetic-public-key", code: 1)
+              }
+              let digest = SHA256.hash(data: publicBytes as Data).map { String(format: "%02x", $0) }.joined()
+              let message = Data("stored-synthetic-key-control".utf8) as CFData
+              guard let signature = SecKeyCreateSignature(key, .ecdsaSignatureMessageX962SHA256, message, &error) else {
+                  if let e = error { throw e.takeRetainedValue() as Error }
+                  throw NSError(domain: "synthetic-signature", code: 1)
+              }
+              let valid = SecKeyVerifySignature(publicKey, .ecdsaSignatureMessageX962SHA256, message, signature, nil)
+              return (digest, valid)
+          }
+          func effectiveToken(_ key: SecKey) -> String {
+              let attributes = SecKeyCopyAttributes(key) as? [String: Any] ?? [:]
+              return attributes[kSecAttrTokenID as String] as? String ?? "none"
+          }
+          func actualPath(_ keychain: SecKeychain) throws -> String {
+              var buffer = [CChar](repeating: 0, count: Int(PATH_MAX))
+              var count = UInt32(buffer.count)
+              let status = buffer.withUnsafeMutableBufferPointer { p in
+                  SecKeychainGetPath(keychain, &count, p.baseAddress)
+              }
+              try checked(status, "read-lab-keychain-path")
+              return String(cString: buffer)
+          }
+          func unlock(_ keychain: SecKeychain, _ password: String) throws {
+              let bytes = Array(password.utf8)
+              let status = bytes.withUnsafeBytes { p in
+                  SecKeychainUnlock(keychain, UInt32(bytes.count), p.baseAddress, true)
+              }
+              try checked(status, "unlock-only-lab-keychain")
+          }
+          func childReadback() throws -> [String: Any] {
+              let data = FileHandle.standardInput.readDataToEndOfFile()
+              guard let input = try JSONSerialization.jsonObject(with: data) as? [String: String],
+                    let path = input["path"], let password = input["password"],
+                    let tag = input["tag"], let label = input["label"], let expected = input["publicDigest"] else {
+                  throw NSError(domain: "invalid-lab-readback-input", code: 1)
+              }
+              var keychain: SecKeychain?
+              try checked(SecKeychainOpen(path, &keychain), "reopen-only-lab-keychain")
+              guard let kc = keychain else { throw NSError(domain: "missing-lab-keychain", code: 1) }
+              try unlock(kc, password)
+              let key = try load(scope(kc, Data(tag.utf8), label))
+              let result = try proof(key)
+              return ["new_process_signature_verified": result.1,
+                      "new_process_same_public_key": result.0 == expected,
+                      "new_process_effective_token": effectiveToken(key)]
+          }
+          func experiment() throws -> [String: Any] {
+              let temp = ProcessInfo.processInfo.environment["RUNNER_TEMP"]!
+              let path = URL(fileURLWithPath: temp).appendingPathComponent("synthetic-" + UUID().uuidString + ".keychain-db").path
+              let password = UUID().uuidString
+              let tagString = "org.example.mirroring-lab." + UUID().uuidString
+              let tag = Data(tagString.utf8)
+              let label = "Synthetic storage control"
+              let renamed = "Synthetic storage renamed control"
+              var saved: CFArray?
+              try checked(SecKeychainCopySearchList(&saved), "snapshot-search-list")
+              var keychain: SecKeychain?
+              let bytes = Array(password.utf8)
+              let createStatus = path.withCString { p in
+                  bytes.withUnsafeBytes { b in
+                      SecKeychainCreate(p, UInt32(bytes.count), b.baseAddress, false, nil, &keychain)
+                  }
+              }
+              let restoreStatus = SecKeychainSetSearchList(saved!)
+              try checked(createStatus, "create-dedicated-lab-keychain")
+              guard let kc = keychain else { throw NSError(domain: "missing-lab-keychain", code: 2) }
+              defer {
+                  let status = SecKeychainDelete(kc)
+                  _ = SecKeychainSetSearchList(saved!)
+                  print("LAB_KEYCHAIN_CLEANUP_STATUS " + String(status))
+              }
+              try checked(restoreStatus, "restore-search-list")
+              try unlock(kc, password)
+              let parameters: [String: Any] = [
+                  kSecUseKeychain as String: kc,
+                  kSecAttrKeyType as String: kSecAttrKeyTypeECSECPrimeRandom,
+                  kSecAttrKeySizeInBits as String: 256,
+                  kSecPrivateKeyAttrs as String: [
+                      kSecAttrIsPermanent as String: true,
+                      kSecAttrApplicationTag as String: tag,
+                      kSecAttrLabel as String: label
+                  ],
+                  kSecPublicKeyAttrs as String: [kSecAttrIsPermanent as String: false]
+              ]
+              var error: Unmanaged<CFError>?
+              guard let createdKey = SecKeyCreateRandomKey(parameters as CFDictionary, &error) else {
+                  if let e = error { throw e.takeRetainedValue() as Error }
+                  throw NSError(domain: "create-persistent-synthetic-key", code: 1)
+              }
+              let before = try proof(createdKey)
+              let location = try actualPath(kc)
+              let candidates = [location, location + "-db"]
+              let backingPath = candidates.first { FileManager.default.fileExists(atPath: $0) }
+              let hashBefore = backingPath.flatMap { try? Data(contentsOf: URL(fileURLWithPath: $0)) }.map { Data(SHA256.hash(data: $0)) }
+              let renameStatus = SecItemUpdate(scope(kc, tag, label) as CFDictionary,
+                  [kSecAttrLabel as String: renamed] as CFDictionary)
+              try checked(renameStatus, "positive-control-rename")
+              let afterRename = try proof(load(scope(kc, tag, renamed)))
+              let hashAfter = backingPath.flatMap { try? Data(contentsOf: URL(fileURLWithPath: $0)) }.map { Data(SHA256.hash(data: $0)) }
+              let tokenStatus = SecItemUpdate(scope(kc, tag, renamed) as CFDictionary,
+                  [kSecAttrTokenID as String: kSecAttrTokenIDSecureEnclave] as CFDictionary)
+              let afterKey = try load(scope(kc, tag, renamed))
+              let after = try proof(afterKey)
+              let child = Process()
+              child.executableURL = URL(fileURLWithPath: CommandLine.arguments[0])
+              child.arguments = ["--readback"]
+              let inputPipe = Pipe()
+              let outputPipe = Pipe()
+              child.standardInput = inputPipe
+              child.standardOutput = outputPipe
+              try child.run()
+              let config = ["path": location, "password": password, "tag": tagString,
+                            "label": renamed, "publicDigest": before.0]
+              inputPipe.fileHandleForWriting.write(try JSONSerialization.data(withJSONObject: config))
+              inputPipe.fileHandleForWriting.closeFile()
+              let childData = outputPipe.fileHandleForReading.readDataToEndOfFile()
+              child.waitUntilExit()
+              let readback = (try? JSONSerialization.jsonObject(with: childData)) ?? ["readback_parse_failed": true]
+              guard before.1, afterRename.1, after.1, child.terminationStatus == 0 else {
+                  throw NSError(domain: "synthetic-control-verification", code: 1)
+              }
+              return [
+                  "backend": "isolated-file-based-control-not-a-Mirroring-record",
+                  "lab_storage_path": location.replacingOccurrences(of: temp, with: "$RUNNER_TEMP"),
+                  "lab_storage_file_exists": backingPath != nil,
+                  "search_list_restored_after_creation": restoreStatus == errSecSuccess,
+                  "rename_control_status": renameStatus,
+                  "rename_preserves_public_key": before.0 == afterRename.0,
+                  "database_bytes_changed_after_rename": hashBefore != hashAfter,
+                  "requested_token_update_status": tokenStatus,
+                  "effective_token_after_update": effectiveToken(afterKey),
+                  "same_public_key_after_token_update": before.0 == after.0,
+                  "signature_after_token_update_verified": after.1,
+                  "readback_in_new_process": readback,
+                  "private_material_exported": false,
+                  "real_user_keychain_queried": false,
+                  "iphone_pairing_tested": false
+              ]
+          }
+          do {
+              if CommandLine.arguments.contains("--readback") { emit(try childReadback()) }
+              else { emit(try experiment()) }
+          } catch {
+              let e = error as NSError
+              emit(["experiment_error_domain": e.domain, "experiment_error_code": e.code])
+              exit(1)
+          }
+          SWIFT
+          /usr/bin/xcrun swiftc "$RUNNER_TEMP/stored_key_probe.swift" -o "$RUNNER_TEMP/stored_key_probe"
+          "$RUNNER_TEMP/stored_key_probe"
+
+  authentication-static-map:
+    runs-on: macos-15-intel
+    timeout-minutes: 10
+    steps:
+      - name: Read only static authentication and storage references in Apple's binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          /usr/bin/sw_vers
+          python3 - <<'PY'
+          import hashlib, json, os, re, subprocess
+          paths = ['/usr/libexec/sharingd', '/System/Applications/iPhone Mirroring.app/Contents/MacOS/iPhone Mirroring']
+          patterns = {
+              'class_and_protocol_candidates': r'^(?:SD|SF).*(?:AutoUnlock|Authentication|Unlock|AKS|Keychain|KeyManager)',
+              'storage_and_crypto_candidates': r'keychain|keybag|escrow|attest|aks_|MKB|(?:store|save|load|copy|delete|remove).*(?:LTK|Identity|Secret|RemoteToken|EncryptionKey)|wrapped.?record',
+              'service_identifier_candidates': r'com\.apple\..*(?:unlock|authentication|oneness|sharing.*key|keychain)|ContinuityUnlock|AutoUnlock.*(?:LTK|Secret)'
+          }
+          for path in paths:
+              if not os.path.isfile(path):
+                  print(json.dumps({'binary': path, 'present_on_disk': False}))
+                  continue
+              with open(path, 'rb') as stream:
+                  digest = hashlib.sha256(stream.read()).hexdigest()
+              strings = subprocess.run(['/usr/bin/strings', '-a', path], capture_output=True, text=True, errors='replace', timeout=90)
+              lines = sorted(set(strings.stdout.splitlines()))
+              imports = subprocess.run(['/usr/bin/nm', '-u', path], capture_output=True, text=True, errors='replace', timeout=90)
+              selected_imports = [line for line in imports.stdout.splitlines() if re.search(r'aks_|AKS|MKB|SecItem|SecKey|attest', line, re.I)]
+              report = {'binary': path, 'sha256': digest, 'static_candidates_only': True,
+                        'keychain_items_queried': False, 'managers_or_services_invoked': False,
+                        'selected_imports': selected_imports[:100]}
+              for name, expression in patterns.items():
+                  matches = [line for line in lines if re.search(expression, line, re.I)]
+                  report[name] = matches[:100]
+                  report[name + '_total'] = len(matches)
+              print(json.dumps(report, indent=2, sort_keys=True))
+          PY
