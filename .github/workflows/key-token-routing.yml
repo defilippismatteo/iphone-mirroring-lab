@@ -1,0 +1,128 @@
+name: Synthetic key token routing experiment
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  token-routing:
+    runs-on: macos-15-intel
+    timeout-minutes: 10
+    steps:
+      - name: Test requested hardware token using synthetic in-memory keys
+        shell: bash
+        run: |
+          set -euo pipefail
+          /usr/bin/sw_vers
+          /usr/bin/uname -m
+          cat > "$RUNNER_TEMP/token_routing.swift" <<'SWIFT'
+          import Foundation
+          import Security
+          import CryptoKit
+          import Darwin
+
+          func failure(_ error: Unmanaged<CFError>?) -> [String: Any] {
+              guard let e = error?.takeRetainedValue() else {
+                  return ["created": false, "error": "No error returned"]
+              }
+              return ["created": false,
+                      "error_code": CFErrorGetCode(e),
+                      "error_domain": CFErrorGetDomain(e) as String]
+          }
+
+          func publicData(_ key: SecKey) -> Data? {
+              guard let publicKey = SecKeyCopyPublicKey(key) else { return nil }
+              var error: Unmanaged<CFError>?
+              guard let data = SecKeyCopyExternalRepresentation(publicKey, &error) else {
+                  if let e = error { _ = e.takeRetainedValue() }
+                  return nil
+              }
+              return data as Data
+          }
+
+          func signsAndVerifies(_ key: SecKey) -> Bool {
+              guard SecKeyIsAlgorithmSupported(key, .sign, .ecdsaSignatureMessageX962SHA256),
+                    let publicKey = SecKeyCopyPublicKey(key) else { return false }
+              let message = Data("synthetic-token-routing-probe".utf8)
+              var error: Unmanaged<CFError>?
+              guard let signature = SecKeyCreateSignature(
+                  key, .ecdsaSignatureMessageX962SHA256, message as CFData, &error
+              ) else {
+                  if let e = error { _ = e.takeRetainedValue() }
+                  return false
+              }
+              return SecKeyVerifySignature(
+                  publicKey, .ecdsaSignatureMessageX962SHA256,
+                  message as CFData, signature, nil
+              )
+          }
+
+          let attributes: [String: Any] = [
+              kSecAttrKeyType as String: kSecAttrKeyTypeECSECPrimeRandom,
+              kSecAttrKeySizeInBits as String: 256,
+              kSecAttrIsPermanent as String: false
+          ]
+          var generationError: Unmanaged<CFError>?
+          guard let source = SecKeyCreateRandomKey(attributes as CFDictionary, &generationError) else {
+              print(failure(generationError)); exit(1)
+          }
+          var exportError: Unmanaged<CFError>?
+          // Only this newly generated synthetic private key is serialized, in RAM.
+          // The bytes are never printed, written to a file, or uploaded.
+          guard let syntheticBlob = SecKeyCopyExternalRepresentation(source, &exportError),
+                let sourcePublic = publicData(source) else {
+              print(failure(exportError)); exit(1)
+          }
+
+          func importProbe(_ blob: CFData, requestToken: Bool) -> [String: Any] {
+              var parameters: [String: Any] = [
+                  kSecAttrKeyType as String: kSecAttrKeyTypeECSECPrimeRandom,
+                  kSecAttrKeyClass as String: kSecAttrKeyClassPrivate,
+                  kSecAttrKeySizeInBits as String: 256,
+                  kSecAttrIsPermanent as String: false
+              ]
+              if requestToken {
+                  parameters[kSecAttrTokenID as String] = kSecAttrTokenIDSecureEnclave
+              }
+              var error: Unmanaged<CFError>?
+              guard let key = SecKeyCreateWithData(blob, parameters as CFDictionary, &error) else {
+                  return failure(error)
+              }
+              // Whitelist one metadata field. Never print the full attributes:
+              // some backends can include private key data in that dictionary.
+              let copiedAttributes = SecKeyCopyAttributes(key) as? [String: Any] ?? [:]
+              let token = copiedAttributes[kSecAttrTokenID as String] as? String
+              return [
+                  "created": true,
+                  "effective_token": token ?? "none",
+                  "reports_secure_enclave_token": token == (kSecAttrTokenIDSecureEnclave as String),
+                  "same_source_public_key": publicData(key) == sourcePublic,
+                  "signature_verified": signsAndVerifies(key)
+              ]
+          }
+
+          let emptyBlob = Data() as CFData
+          let control = importProbe(syntheticBlob, requestToken: false)
+          let requested = importProbe(syntheticBlob, requestToken: true)
+          let emptyControl = importProbe(emptyBlob, requestToken: false)
+          let emptyRequested = importProbe(emptyBlob, requestToken: true)
+          let report: [String: Any] = [
+              "cryptokit_secure_enclave_available": SecureEnclave.isAvailable,
+              "software_import_control": control,
+              "requested_token_with_software_blob": requested,
+              "empty_blob_without_token": emptyControl,
+              "empty_blob_with_requested_token": emptyRequested,
+              "synthetic_private_serialization_in_memory_only": true,
+              "permanent_keys_requested": false,
+              "existing_user_keys_accessed": false,
+              "iphone_pairing_tested": false,
+              "interpretation": "A token request may route to CryptoTokenKit instead of importing keyData. Import or signing success alone does not establish hardware origin or iPhone acceptance."
+          ]
+          let data = try JSONSerialization.data(withJSONObject: report, options: [.prettyPrinted, .sortedKeys])
+          print(String(decoding: data, as: UTF8.self))
+          if control["signature_verified"] as? Bool != true || control["same_source_public_key"] as? Bool != true {
+              exit(1)
+          }
+          SWIFT
+          /usr/bin/xcrun swift "$RUNNER_TEMP/token_routing.swift"
