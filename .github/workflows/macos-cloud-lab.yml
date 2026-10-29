@@ -1,0 +1,154 @@
+name: macOS Intel isolated software lab
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: macos-intel-isolated-lab
+  cancel-in-progress: true
+
+jobs:
+  baseline:
+    runs-on: macos-15-intel
+    timeout-minutes: 10
+    steps:
+      - name: Verify the remote operating system
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = "x86_64"
+          test "$(/usr/bin/sw_vers -productVersion | /usr/bin/cut -d . -f 1)" = "15"
+          /usr/bin/sw_vers
+          /usr/bin/uname -m
+
+      - name: Create and verify nonpersistent keys in the remote VM
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/ephemeral_key_probe.swift" <<'SWIFT'
+          import Foundation
+          import Security
+          import CryptoKit
+          import Darwin
+
+          func failure(_ error: Unmanaged<CFError>?, stage: String) -> [String: Any] {
+              guard let value = error?.takeRetainedValue() else {
+                  return ["created": false, "stage": stage, "error": "No error description"]
+              }
+              return ["created": false, "stage": stage,
+                      "error_code": CFErrorGetCode(value),
+                      "error": (value as Error).localizedDescription]
+          }
+
+          func probe(enclave: Bool) -> [String: Any] {
+              var attributes: [String: Any] = [
+                  kSecAttrKeyType as String: kSecAttrKeyTypeECSECPrimeRandom,
+                  kSecAttrKeySizeInBits as String: 256,
+                  kSecAttrIsPermanent as String: false
+              ]
+              if enclave {
+                  var aclError: Unmanaged<CFError>?
+                  guard let acl = SecAccessControlCreateWithFlags(
+                      nil, kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
+                      .privateKeyUsage, &aclError
+                  ) else {
+                      return failure(aclError, stage: "access_control")
+                  }
+                  attributes[kSecAttrTokenID as String] = kSecAttrTokenIDSecureEnclave
+                  attributes[kSecPrivateKeyAttrs as String] = [
+                      kSecAttrIsPermanent as String: false,
+                      kSecAttrAccessControl as String: acl
+                  ]
+              }
+              var keyError: Unmanaged<CFError>?
+              guard let key = SecKeyCreateRandomKey(attributes as CFDictionary, &keyError) else {
+                  return failure(keyError, stage: "key_generation")
+              }
+              guard SecKeyIsAlgorithmSupported(key, .sign, .ecdsaSignatureMessageX962SHA256) else {
+                  return ["created": true, "signature_verified": false, "stage": "algorithm_support"]
+              }
+              let message = Data("isolated-lab-generated-message".utf8)
+              var signingError: Unmanaged<CFError>?
+              guard let signature = SecKeyCreateSignature(
+                  key, .ecdsaSignatureMessageX962SHA256,
+                  message as CFData, &signingError
+              ) else {
+                  var result = failure(signingError, stage: "signing")
+                  result["created"] = true
+                  result["signature_verified"] = false
+                  return result
+              }
+              guard let publicKey = SecKeyCopyPublicKey(key) else {
+                  return ["created": true, "signature_verified": false,
+                          "stage": "public_key_reference"]
+              }
+              var verificationError: Unmanaged<CFError>?
+              let verified = SecKeyVerifySignature(
+                  publicKey, .ecdsaSignatureMessageX962SHA256,
+                  message as CFData, signature, &verificationError
+              )
+              let tampered = Data("isolated-lab-altered-message".utf8)
+              let tamperedAccepted = SecKeyVerifySignature(
+                  publicKey, .ecdsaSignatureMessageX962SHA256,
+                  tampered as CFData, signature, nil
+              )
+              var result: [String: Any] = [
+                  "created": true, "signature_verified": verified,
+                  "tampered_message_rejected": !tamperedAccepted
+              ]
+              if !verified {
+                  result["verification_error"] = failure(verificationError, stage: "verification")
+              }
+              return result
+          }
+
+          let software = probe(enclave: false)
+          let enclave = probe(enclave: true)
+          let report: [String: Any] = [
+              "cryptokit_secure_enclave_available": SecureEnclave.isAvailable,
+              "software": software,
+              "secure_enclave": enclave,
+              "permanent_keys_requested": false,
+              "private_keys_exported": false,
+              "iphone_pairing_tested": false,
+              "mirroring_bypass_implemented": false
+          ]
+          let data = try JSONSerialization.data(withJSONObject: report, options: [.prettyPrinted, .sortedKeys])
+          print(String(decoding: data, as: UTF8.self))
+          if software["signature_verified"] as? Bool != true || software["tampered_message_rejected"] as? Bool != true { exit(1) }
+          SWIFT
+          /usr/bin/xcrun swift "$RUNNER_TEMP/ephemeral_key_probe.swift"
+
+      - name: Inspect only the remote VM's Mirroring application
+        shell: bash
+        run: |
+          set -euo pipefail
+          LAB_APP='/System/Applications/iPhone Mirroring.app'
+          if [ -f "$LAB_APP/Contents/Info.plist" ]; then
+            /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$LAB_APP/Contents/Info.plist"
+            /usr/bin/shasum -a 256 "$LAB_APP/Contents/MacOS/iPhone Mirroring"
+            /usr/bin/otool -L "$LAB_APP/Contents/MacOS/iPhone Mirroring"
+            /usr/bin/nm -u "$LAB_APP/Contents/MacOS/iPhone Mirroring" | /usr/bin/xcrun swift-demangle | /usr/bin/grep -Ei "Eligibility|RemoteAuthentication|TestAutomation" || true
+            /usr/bin/otool -tvV "$LAB_APP/Contents/MacOS/iPhone Mirroring" | /usr/bin/grep -n -B 4 -A 8 "OSEligibilityBackedOneness|LocalAuthentication|RemoteAuthentication" || true
+            /usr/bin/strings -a "$LAB_APP/Contents/MacOS/iPhone Mirroring" | /usr/bin/grep -Ei 'isDeviceEligible|TestAutomationOneness|attest|SecureEnclave' || true
+            LAB_UI="$LAB_APP/Contents/Frameworks/ScreenContinuityUI.framework/Versions/A/ScreenContinuityUI"
+            if [ -f "$LAB_UI" ]; then
+              /usr/bin/strings -a "$LAB_UI" | /usr/bin/grep -Ei 'eligible|eligibility|Mock.*Authentication|Skipping timeout|attest|SecureEnclave' || true
+            fi
+          else
+            echo 'iPhone Mirroring is not included in this runner image.'
+          fi
+
+      - name: Record experiment limits
+        shell: bash
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" <<'REPORT'
+          This job used a disposable GitHub-hosted macOS Intel VM.
+
+          - No Apple Account, iPhone, existing Keychain entries, or local Mac files were used.
+          - Only temporary keys and a generated test message were used; no private key was exported.
+          - No authentication, SIP, NVRAM, firmware, or system binaries were modified.
+          - Success verifies the software-key baseline, not a Mirroring bypass or iPhone pairing.
+          REPORT
